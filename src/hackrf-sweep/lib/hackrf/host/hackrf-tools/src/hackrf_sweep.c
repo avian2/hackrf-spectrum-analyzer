@@ -98,7 +98,7 @@ int gettimeofday(struct timeval *tv, void* ignored) {
 #define FREQ_MAX_MHZ (7250) /* 7250 MHz */
 
 #define DEFAULT_SAMPLE_RATE_HZ (20000000) /* 20MHz default sample rate */
-#define DEFAULT_BASEBAND_FILTER_BANDWIDTH (15000000) /* 5MHz default */
+#define DEFAULT_BASEBAND_FILTER_BANDWIDTH (15000000) /* 15MHz default */
 
 #define TUNE_STEP (DEFAULT_SAMPLE_RATE_HZ / FREQ_ONE_MHZ)
 #define OFFSET 7500000
@@ -107,10 +107,13 @@ int gettimeofday(struct timeval *tv, void* ignored) {
 #define THROWAWAY_BLOCKS 2
 
 #if defined _WIN32
-	#define sleep(a) Sleep( (a*1000) )
+	#define m_sleep(a) Sleep( (a) )
+#else
+	#define m_sleep(a) usleep((a*1000))
 #endif
 
 static uint32_t num_samples = SAMPLES_PER_BLOCK;
+static uint32_t num_sweeps = 0;
 static int num_ranges = 0;
 static uint16_t frequencies[MAX_SWEEP_RANGES*2];
 static int step_count;
@@ -167,7 +170,7 @@ int parse_u32_range(char* s, uint32_t* const value_min, uint32_t* const value_ma
 
 static volatile bool do_exit = false;
 
-static FILE* fd = NULL;
+static FILE* outfile = NULL;
 static volatile uint32_t byte_count = 0;
 static volatile uint64_t sweep_count = 0;
 
@@ -184,6 +187,7 @@ static uint32_t antenna_enable;
 static bool binary_output = false;
 static bool ifft_output = false;
 static bool one_shot = false;
+static bool finite_mode = false;
 static volatile bool sweep_started = false;
 
 static int fftSize = 20;
@@ -211,7 +215,7 @@ float logPower(fftwf_complex in, float scale)
 	float re = in[0] * scale;
 	float im = in[1] * scale;
 	float magsq = re * re + im * im;
-	return log2f(magsq) * 10.0f / log2(10.0f);
+	return (float) (log2(magsq) * 10.0f / log2(10.0f));
 }
 
 int rx_callback(hackrf_transfer* transfer) {
@@ -231,7 +235,7 @@ int rx_callback(hackrf_transfer* transfer) {
 #endif
 	bool stopProcessing = false;
 
-	if(NULL == fd) {
+	if(NULL == outfile) {
 		return -1;
 	}
 
@@ -263,12 +267,15 @@ int rx_callback(hackrf_transfer* transfer) {
 					for(i=0; i < ifft_bins; i++) {
 						ifftwOut[i][0] *= 1.0f / ifft_bins;
 						ifftwOut[i][1] *= 1.0f / ifft_bins;
-						fwrite(&ifftwOut[i][0], sizeof(float), 1, fd);
-						fwrite(&ifftwOut[i][1], sizeof(float), 1, fd);
+						fwrite(&ifftwOut[i][0], sizeof(float), 1, outfile);
+						fwrite(&ifftwOut[i][1], sizeof(float), 1, outfile);
 					}
 				}
 				sweep_count++;
 				if(one_shot) {
+					do_exit = true;
+				}
+				else if(finite_mode && sweep_count == num_sweeps) {
 					do_exit = true;
 				}
 			}
@@ -278,8 +285,8 @@ int rx_callback(hackrf_transfer* transfer) {
 					(uint64_t)(num_samples + THROWAWAY_BLOCKS * SAMPLES_PER_BLOCK)
 					* j * FREQ_ONE_MHZ / DEFAULT_SAMPLE_RATE_HZ;
 			if(999999 < time_stamp.tv_usec) {
-				time_stamp.tv_usec = time_stamp.tv_usec % 1000000;
 				time_stamp.tv_sec += time_stamp.tv_usec / 1000000;
+				time_stamp.tv_usec = time_stamp.tv_usec % 1000000;
 			}
 		}
 		if(do_exit) {
@@ -336,22 +343,22 @@ int rx_callback(hackrf_transfer* transfer) {
 			record_length = 2 * sizeof(band_edge)
 					+ (fftSize/4) * sizeof(float);
 
-			fwrite(&record_length, sizeof(record_length), 1, fd);
+			fwrite(&record_length, sizeof(record_length), 1, outfile);
 			band_edge = frequency;
-			fwrite(&band_edge, sizeof(band_edge), 1, fd);
+			fwrite(&band_edge, sizeof(band_edge), 1, outfile);
 			band_edge = frequency + DEFAULT_SAMPLE_RATE_HZ / 4;
-			fwrite(&band_edge, sizeof(band_edge), 1, fd);
-			fwrite(&pwr[1+(fftSize*5)/8], sizeof(float), fftSize/4, fd);
+			fwrite(&band_edge, sizeof(band_edge), 1, outfile);
+			fwrite(&pwr[1+(fftSize*5)/8], sizeof(float), fftSize/4, outfile);
 
-			fwrite(&record_length, sizeof(record_length), 1, fd);
+			fwrite(&record_length, sizeof(record_length), 1, outfile);
 			band_edge = frequency + DEFAULT_SAMPLE_RATE_HZ / 2;
-			fwrite(&band_edge, sizeof(band_edge), 1, fd);
+			fwrite(&band_edge, sizeof(band_edge), 1, outfile);
 			band_edge = frequency + (DEFAULT_SAMPLE_RATE_HZ * 3) / 4;
-			fwrite(&band_edge, sizeof(band_edge), 1, fd);
-			fwrite(&pwr[1+fftSize/8], sizeof(float), fftSize/4, fd);
+			fwrite(&band_edge, sizeof(band_edge), 1, outfile);
+			fwrite(&pwr[1+fftSize/8], sizeof(float), fftSize/4, outfile);
 #endif
 		} else if(ifft_output) {
-			ifft_idx = round((frequency - (uint64_t)(FREQ_ONE_MHZ*frequencies[0]))
+			ifft_idx = (uint32_t) round((frequency - (uint64_t)(FREQ_ONE_MHZ*frequencies[0]))
 					/ fft_bin_width);
 			ifft_idx = (ifft_idx + ifft_bins/2) % ifft_bins;
 			for(i = 0; (fftSize / 4) > i; i++) {
@@ -365,9 +372,10 @@ int rx_callback(hackrf_transfer* transfer) {
 				ifftwIn[ifft_idx + i][1] = fftwOut[i + 1 + (fftSize/8)][1];
 			}
 		} else {
-			fft_time = localtime(&time_stamp.tv_sec);
+			time_t time_stamp_seconds = time_stamp.tv_sec;
+			fft_time = localtime(&time_stamp_seconds);
 			strftime(time_str, 50, "%Y-%m-%d, %H:%M:%S", fft_time);
-			fprintf(fd, "%s.%06ld, %" PRIu64 ", %" PRIu64 ", %.2f, %u",
+			fprintf(outfile, "%s.%06ld, %" PRIu64 ", %" PRIu64 ", %.2f, %u",
 					time_str,
 					(long int)time_stamp.tv_usec,
 					(uint64_t)(frequency),
@@ -375,10 +383,10 @@ int rx_callback(hackrf_transfer* transfer) {
 					fft_bin_width,
 					fftSize);
 			for(i = 0; (fftSize / 4) > i; i++) {
-				fprintf(fd, ", %.2f", pwr[i + 1 + (fftSize*5)/8]);
+				fprintf(outfile, ", %.2f", pwr[i + 1 + (fftSize*5)/8]);
 			}
-			fprintf(fd, "\n");
-			fprintf(fd, "%s.%06ld, %" PRIu64 ", %" PRIu64 ", %.2f, %u",
+			fprintf(outfile, "\n");
+			fprintf(outfile, "%s.%06ld, %" PRIu64 ", %" PRIu64 ", %.2f, %u",
 					time_str,
 					(long int)time_stamp.tv_usec,
 					(uint64_t)(frequency+(DEFAULT_SAMPLE_RATE_HZ/2)),
@@ -386,9 +394,9 @@ int rx_callback(hackrf_transfer* transfer) {
 					fft_bin_width,
 					fftSize);
 			for(i = 0; (fftSize / 4) > i; i++) {
-				fprintf(fd, ", %.2f", pwr[i + 1 + (fftSize/8)]);
+				fprintf(outfile, ", %.2f", pwr[i + 1 + (fftSize/8)]);
 			}
-			fprintf(fd, "\n");
+			fprintf(outfile, "\n");
 		}
 	}
 
@@ -413,6 +421,7 @@ static void usage() {
 	fprintf(stderr, "\t[-n num_samples] # Number of samples per frequency, 8192-4294967296\n");
 	fprintf(stderr, "\t[-w bin_width] # FFT bin width (frequency resolution) in Hz\n");
 	fprintf(stderr, "\t[-1] # one shot mode\n");
+	fprintf(stderr, "\t[-N num_sweeps] # Number of sweeps to perform\n");
 	fprintf(stderr, "\t[-B] # binary output\n");
 	fprintf(stderr, "\t[-I] # binary inverse FFT output\n");
 	fprintf(stderr, "\t-r filename # output file\n");
@@ -462,6 +471,7 @@ int main(int argc, char** argv) {
 	const char* serial_number = NULL;
 	int exit_code = EXIT_SUCCESS;
 	struct timeval time_now;
+	struct timeval time_prev;
 	float time_diff;
 	float sweep_rate;
 
@@ -519,7 +529,7 @@ int main(int argc, char** argv) {
 	amp_enable = !!_enableAntennaLNA;
 
 #else
-	while( (opt = getopt(argc, argv, "a:f:p:l:g:d:n:w:1BIr:h?")) != EOF ) {
+	while( (opt = getopt(argc, argv, "a:f:p:l:g:d:n:N:w:1BIr:h?")) != EOF ) {
 		result = HACKRF_SUCCESS;
 		switch( opt ) 
 		{
@@ -574,6 +584,11 @@ int main(int argc, char** argv) {
 
 		case 'n':
 			result = parse_u32(optarg, &num_samples);
+			break;
+
+		case 'N':
+			finite_mode = true;
+			result = parse_u32(optarg, &num_sweeps);
 			break;
 
 		case 'w':
@@ -691,7 +706,7 @@ int main(int argc, char** argv) {
 	pwr = (float*)fftwf_malloc(sizeof(float) * fftSize);
 	window = (float*)fftwf_malloc(sizeof(float) * fftSize);
 	for (i = 0; i < fftSize; i++) {
-		window[i] = 0.5f * (1.0f - cos(2 * M_PI * i / (fftSize - 1)));
+		window[i] = (float) (0.5f * (1.0f - cos(2 * M_PI * i / (fftSize - 1))));
 	}
 //#define HACKRF_SWEEP_AS_LIBRARY
 #ifdef HACKRF_SWEEP_AS_LIBRARY
@@ -753,17 +768,17 @@ int main(int argc, char** argv) {
 	}
 
 	if((NULL == path) || (strcmp(path, "-") == 0)) {
-		fd = stdout;
+		outfile = stdout;
 	} else {
-		fd = fopen(path, "wb");
+		outfile = fopen(path, "wb");
 	}
 
-	if(NULL == fd) {
+	if(NULL == outfile) {
 		fprintf(stderr, "Failed to open file: %s\n", path);
 		return EXIT_FAILURE;
 	}
-	/* Change fd buffer to have bigger one to store or read data on/to HDD */
-	result = setvbuf(fd , NULL , _IOFBF , FD_BUFFER_SIZE);
+	/* Change outfile buffer to have bigger one to store or read data on/to HDD */
+	result = setvbuf(outfile , NULL , _IOFBF , FD_BUFFER_SIZE);
 	if( result != 0 ) {
 		fprintf(stderr, "setvbuf() failed: %d\n", result);
 		usage();
@@ -815,7 +830,7 @@ int main(int argc, char** argv) {
 	for(i = 0; i < num_ranges; i++) {
 		step_count = 1 + (frequencies[2*i+1] - frequencies[2*i] - 1)
 				/ TUNE_STEP;
-		frequencies[2*i+1] = frequencies[2*i] + step_count * TUNE_STEP;
+		frequencies[2*i+1] = (uint16_t) (frequencies[2*i] + step_count * TUNE_STEP);
 		fprintf(stderr, "Sweeping from %u MHz to %u MHz\n",
 				frequencies[2*i], frequencies[2*i+1]);
 	}
@@ -826,13 +841,6 @@ int main(int argc, char** argv) {
 		ifftwPlan = fftwf_plan_dft_1d(fftSize * step_count, ifftwIn, ifftwOut, FFTW_BACKWARD, FFTW_MEASURE);
 	}
 
-	result |= hackrf_start_rx(device, rx_callback, NULL);
-	if (result != HACKRF_SUCCESS) {
-		fprintf(stderr, "hackrf_start_rx() failed: %s (%d)\n", hackrf_error_name(result), result);
-		usage();
-		return EXIT_FAILURE;
-	}
-
 	result = hackrf_init_sweep(device, frequencies, num_ranges, num_samples * 2,
 			TUNE_STEP * FREQ_ONE_MHZ, OFFSET, INTERLEAVED);
 	if( result != HACKRF_SUCCESS ) {
@@ -841,7 +849,14 @@ int main(int argc, char** argv) {
 		return EXIT_FAILURE;
 	}
 
-	{
+	result |= hackrf_start_rx_sweep(device, rx_callback, NULL);
+	if (result != HACKRF_SUCCESS) {
+		fprintf(stderr, "hackrf_start_rx_sweep() failed: %s (%d)\n", hackrf_error_name(result), result);
+		usage();
+		return EXIT_FAILURE;
+	}
+
+	if (amp) {
 		fprintf(stderr, "call hackrf_set_amp_enable(%u)\n", amp_enable);
 		result = hackrf_set_amp_enable(device, (uint8_t)amp_enable);
 		if (result != HACKRF_SUCCESS) {
@@ -852,7 +867,7 @@ int main(int argc, char** argv) {
 		}
 	}
 
-	{
+	if (antenna) {
 		fprintf(stderr, "call hackrf_set_antenna_enable(%u)\n", antenna_enable);
 		result = hackrf_set_antenna_enable(device, (uint8_t)antenna_enable);
 		if (result != HACKRF_SUCCESS) {
@@ -864,13 +879,13 @@ int main(int argc, char** argv) {
 	}
 
 	gettimeofday(&t_start, NULL);
+	time_prev = t_start;
 
 	fprintf(stderr, "Stop with Ctrl-C\n");
-	sweep_count	= 0;
 	while((hackrf_is_streaming(device) == HACKRF_TRUE) && (do_exit == false)) {
 		float time_difference;
 #ifndef  HACKRF_SWEEP_AS_LIBRARY
-		sleep(1);
+		m_sleep(50);
 #else
 		//allows fast shutdown
 		int limit	= 20*10;
@@ -880,20 +895,22 @@ int main(int argc, char** argv) {
 		if(do_exit)
 			break;
 #endif
-		
-		gettimeofday(&time_now, NULL);
-		
-		time_difference = TimevalDiff(&time_now, &t_start);
-		sweep_rate = (float)sweep_count / time_difference;
-		fprintf(stderr, "%" PRIu64 " total sweeps completed, %.2f sweeps/second\n",
-				sweep_count, sweep_rate);
 
-		if (byte_count == 0) {
-			exit_code = EXIT_FAILURE;
-			fprintf(stderr, "\nCouldn't transfer any data for one second.\n");
-			break;
+		gettimeofday(&time_now, NULL);
+		if (TimevalDiff(&time_now, &time_prev) >= 1.0f) {
+			time_difference = TimevalDiff(&time_now, &t_start);
+			sweep_rate = (float)sweep_count / time_difference;
+			fprintf(stderr, "%" PRIu64 " total sweeps completed, %.2f sweeps/second\n",
+					sweep_count, sweep_rate);
+
+			if (byte_count == 0) {
+				exit_code = EXIT_FAILURE;
+				fprintf(stderr, "\nCouldn't transfer any data for one second.\n");
+				break;
+			}
+			byte_count = 0;
+			time_prev = time_now;
 		}
-		byte_count = 0;
 	}
 
 	result = hackrf_is_streaming(device);	
@@ -930,12 +947,13 @@ int main(int argc, char** argv) {
 		fprintf(stderr, "hackrf_exit() done\n");
 	}
 
-	if(fd != NULL) {
+	fflush(outfile);
+	if ( ( outfile != NULL ) && ( outfile != stdout ) ) {
 #ifndef  HACKRF_SWEEP_AS_LIBRARY
-		fclose(fd);
+		fclose(outfile);
 #endif
-		fd = NULL;
-		fprintf(stderr, "fclose(fd) done\n");
+		outfile = NULL;
+		fprintf(stderr, "fclose() done\n");
 	}
 	fftwf_free(fftwIn);
 	fftwf_free(fftwOut);
